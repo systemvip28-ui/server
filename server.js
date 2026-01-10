@@ -7,12 +7,14 @@ const path = require("path");
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" }
+  cors: {
+    origin: "*"
+  }
 });
 
 const DB_FILE = path.join(__dirname, "data.json");
 
-// ================= DB Helper =================
+// Fungsi baca DB
 function readDB() {
   if (!fs.existsSync(DB_FILE)) {
     fs.writeFileSync(DB_FILE, JSON.stringify({ users: {} }, null, 2));
@@ -20,90 +22,99 @@ function readDB() {
   return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
 }
 
+// Fungsi tulis DB
 function writeDB(data) {
   fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
-// ================= Socket.IO =================
 io.on("connection", socket => {
   console.log("Client connected:", socket.id);
 
-  // user join room
+  // User join room
   socket.on("join", userId => {
     if (!userId) return;
+
     socket.join(userId);
+    console.log(`User join room: ${userId}`);
 
     const db = readDB();
+
     if (!db.users[userId]) {
-      db.users[userId] = { balance: 50000, status: "Aktif" };
+      db.users[userId] = { balance: 50000 };
       writeDB(db);
     }
 
-    io.to(userId).emit("statusUpdate", {
+    io.to(userId).emit("saldoUpdate", {
       userId,
-      balance: db.users[userId].balance,
-      status: db.users[userId].status
+      balance: db.users[userId].balance
     });
   });
 
-  // admin cek saldo/status
+  // Admin check saldo
   socket.on("adminCheckSaldo", userId => {
     if (!userId) return;
+
     const db = readDB();
-    const user = db.users[userId] || { balance: 50000, status: "Aktif" };
-    io.to(userId).emit("statusUpdate", {
+    const balance = db.users[userId]?.balance ?? 0;
+
+    io.to(userId).emit("saldoUpdate", {
       userId,
-      balance: user.balance,
-      status: user.status
+      balance
     });
   });
 
-  // admin update saldo / teks
-  socket.on("adminSendMessage", data => {
-    if (!data || !data.userId || !data.content) return;
+  // Admin update saldo
+  socket.on("adminUpdateSaldo", data => {
+    if (!data || !data.userId) return;
 
     const db = readDB();
-    const userId = data.userId;
-    let payload = {};
+    let newBalance;
 
-    if (!db.users[userId]) db.users[userId] = { balance: 50000, status: "Aktif" };
-
-    // angka → update saldo + status otomatis
-    if (!isNaN(data.content)) {
-      const newBalance = Number(data.content);
-      db.users[userId].balance = newBalance;
-      db.users[userId].status = newBalance > 0 ? "Aktif" : "Blocked";
-      writeDB(db);
-
-      payload = { type: "status", userId, balance: newBalance, status: db.users[userId].status };
+    // Pastikan jika balance dikirim angka, simpan angka, jika string simpan string
+    if (typeof data.balance === "number") {
+      newBalance = data.balance;
     } else {
-      // teks bebas → update status saja, saldo tetap
-      db.users[userId].status = data.content;
-      writeDB(db);
-
-      payload = { type: "status", userId, status: data.content };
+      newBalance = Number(data.balance) || 0;
     }
 
-    io.to(userId).emit("statusUpdate", payload);
-    console.log("Admin sent:", payload);
-  });
+    if (!db.users[data.userId]) {
+      db.users[data.userId] = { balance: 50000 };
+    }
 
-  // admin reset saldo → saldo 50k + status Aktif
-  socket.on("adminResetSaldo", userId => {
-    if (!userId) return;
-    const db = readDB();
-    db.users[userId] = { balance: 50000, status: "Aktif" };
+    db.users[data.userId].balance = newBalance;
     writeDB(db);
 
-    io.to(userId).emit("statusUpdate", { userId, balance: 50000, status: "Aktif" });
-    console.log(`Reset user ${userId} → Rp50.000 Aktif`);
+    console.log(`Update saldo ${data.userId}: ${newBalance}`);
+
+    io.to(data.userId).emit("saldoUpdate", {
+      userId: data.userId,
+      balance: newBalance
+    });
   });
 
-  socket.on("disconnect", () => console.log("Client disconnected:", socket.id));
+  // Admin reset saldo
+  socket.on("adminResetSaldo", userId => {
+    if (!userId) return;
+
+    const db = readDB();
+    // Set balance menjadi teks "Aktivasi"
+    db.users[userId] = { balance: "Aktivasi" };
+    writeDB(db);
+
+    console.log(`Reset saldo ${userId} => Aktivasi`);
+
+    io.to(userId).emit("saldoUpdate", {
+      userId,
+      balance: "Aktivasi"
+    });
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Client disconnected:", socket.id);
+  });
 });
 
-// serve static files (optional)
-app.use(express.static(__dirname));
-
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
