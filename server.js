@@ -12,6 +12,14 @@ const io = new Server(server, {
   }
 });
 
+app.head('/', (req, res) => {
+  res.status(200).end();
+});
+
+app.get('/', (req, res) => {
+  res.status(200).send('Live'); 
+});
+
 const DB_FILE = path.join(__dirname, "data.json");
 
 function readDB() {
