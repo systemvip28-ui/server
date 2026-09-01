@@ -21,14 +21,12 @@ app.use(express.static('public'));
 
 app.get('/', (req, res) => res.status(200).send('Server AnonChat Live'));
 
-// STATE MANAGEMENT
-const users = new Map(); // Key: userId -> Value: userData
-const socketToUser = new Map(); // Key: socket.id -> Value: userId
+const users = new Map();
+const socketToUser = new Map();
 let stories = []; 
 
 function getActiveStories() {
   const now = Date.now();
-  // Filter story yang umurnya kurang dari 24 jam
   stories = stories.filter(s => now - s.timestamp < 24 * 60 * 60 * 1000);
   return stories;
 }
@@ -42,12 +40,11 @@ function broadcastUsers() {
 }
 
 io.on('connection', (socket) => {
-  
   socket.on('join', (data) => {
     const userId = data.userId;
     socketToUser.set(socket.id, userId);
     
-    const existingUser = users.get(userId) || { blockedBy: [], blockedUsers: [] };
+    const existingUser = users.get(userId) || { blockedUsers: [] };
     
     users.set(userId, {
       ...existingUser,
@@ -55,7 +52,7 @@ io.on('connection', (socket) => {
       socketId: socket.id,
       name: data.name || 'Anonim',
       bio: data.bio || 'Available',
-      avatar: data.avatar || '',
+      avatar: data.avatar || 'https://cdn-icons-png.flaticon.com/512/149/149071.png',
       lat: data.lat || null,
       lon: data.lon || null,
       online: true,
@@ -64,6 +61,18 @@ io.on('connection', (socket) => {
 
     broadcastUsers();
     socket.emit('update-stories', getActiveStories());
+  });
+
+  // UPDATE PROFIL (Nama, Bio, Foto)
+  socket.on('update-profile', (data) => {
+    const userId = socketToUser.get(socket.id);
+    if(userId && users.has(userId)) {
+      const u = users.get(userId);
+      u.name = data.name;
+      u.bio = data.bio;
+      if(data.avatar) u.avatar = data.avatar;
+      broadcastUsers();
+    }
   });
 
   socket.on('update-location', (coords) => {
@@ -75,15 +84,13 @@ io.on('connection', (socket) => {
     }
   });
 
-  // PRIVATE MESSAGE
+  // PRIVATE MESSAGE & BLOKIR CHECK
   socket.on('private-message', (msgData) => {
     const senderId = socketToUser.get(socket.id);
     const targetUserId = msgData.to;
     const target = users.get(targetUserId);
-    const sender = users.get(senderId);
 
     if (target) {
-      // Cek Blokir
       if (target.blockedUsers && target.blockedUsers.includes(senderId)) {
         return socket.emit('message-error', { error: 'blocked', by: targetUserId });
       }
@@ -96,7 +103,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // BLOKIR USER
   socket.on('block-user', (targetId) => {
     const myId = socketToUser.get(socket.id);
     const me = users.get(myId);
@@ -111,7 +117,15 @@ io.on('connection', (socket) => {
     }
   });
 
-  // STORIES (STATUS)
+  socket.on('unblock-user', (targetId) => {
+    const myId = socketToUser.get(socket.id);
+    const me = users.get(myId);
+    if(me && me.blockedUsers) {
+      me.blockedUsers = me.blockedUsers.filter(id => id !== targetId);
+    }
+  });
+
+  // STORIES
   socket.on('add-story', (data) => {
     const userId = socketToUser.get(socket.id);
     const user = users.get(userId);
@@ -140,11 +154,17 @@ io.on('connection', (socket) => {
     io.emit('update-stories', getActiveStories());
   });
 
-  // WEBRTC CALLS
+  // WEBRTC CALLS & BLOKIR CHECK
   socket.on('call-user', (data) => {
     const senderId = socketToUser.get(socket.id);
     const target = users.get(data.to);
-    if (target && target.online) io.to(target.socketId).emit('incoming-call', { from: senderId, name: users.get(senderId)?.name });
+    
+    if (target) {
+      if (target.blockedUsers && target.blockedUsers.includes(senderId)) {
+        return socket.emit('call-error', { error: 'blocked' });
+      }
+      if (target.online) io.to(target.socketId).emit('incoming-call', { from: senderId, name: users.get(senderId)?.name });
+    }
   });
 
   socket.on('accept-call', (data) => {
