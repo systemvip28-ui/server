@@ -1,120 +1,154 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const fs = require("fs");
-const path = require("path");
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+const cloudinary = require('cloudinary').v2;
+
+cloudinary.config({
+  cloud_name:     'davgb7tjm',        
+  api_key:        '211214865765642',          
+  api_secret:     '3OG8-xUQlkYGt1uYO7yrPVoPFCo',  
+  secure: true
+});
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*"
-  }
-});
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
-app.head('/', (req, res) => {
-  res.status(200).end();
-});
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(express.static('public'));
 
-app.get('/', (req, res) => {
-  res.status(200).send('Live'); 
-});
+app.get('/', (req, res) => res.status(200).send('Live'));
 
-const DB_FILE = path.join(__dirname, "data.json");
+// State Management
+const users = new Map(); // Menyimpan data user online
+const stories = []; // Menyimpan story/status
+const activeCalls = new Map();
 
-function readDB() {
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify({ users: {} }, null, 2));
-  }
-  return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+function broadcastOnlineUsers() {
+  const onlineList = Array.from(users.entries()).map(([id, info]) => ({ socketId: id, ...info }));
+  io.emit("online-users", onlineList);
+  io.emit("online-count", onlineList.length);
 }
 
-function writeDB(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-}
+io.on('connection', (socket) => {
+  
+  socket.on('join', (data) => {
+    const userData = {
+      name: data.name || 'Anonim',
+      bio: data.bio || 'Available',
+      avatar: data.avatar || '',
+      server: data.server || 'default',
+    };
+    users.set(socket.id, userData);
+    broadcastOnlineUsers();
+    
+    // Kirim story yang aktif ke user yang baru join
+    socket.emit('update-stories', stories);
+  });
 
-io.on("connection", socket => {
-  console.log("Client connected:", socket.id);
-
-  socket.on("join", userId => {
-    if (!userId) return;
-
-    socket.join(userId);
-    console.log(`User join room: ${userId}`);
-
-    const db = readDB();
-
-    if (!db.users[userId]) {
-      db.users[userId] = { balance: 50000 };
-      writeDB(db);
+  // Update Profile
+  socket.on('update-profile', (data) => {
+    if (users.has(socket.id)) {
+      const user = users.get(socket.id);
+      user.name = data.name || user.name;
+      user.bio = data.bio || user.bio;
+      user.avatar = data.avatar || user.avatar;
+      users.set(socket.id, user);
+      broadcastOnlineUsers();
     }
-
-    io.to(userId).emit("saldoUpdate", {
-      userId,
-      balance: db.users[userId].balance
-    });
   });
 
-  socket.on("adminCheckSaldo", userId => {
-    if (!userId) return;
-
-    const db = readDB();
-    const balance = db.users[userId]?.balance ?? 0;
-
-    io.to(userId).emit("saldoUpdate", {
-      userId,
-      balance
-    });
-  });
-
-  socket.on("adminUpdateSaldo", data => {
-    if (!data || !data.userId) return;
-
-    const db = readDB();
-    let newBalance;
-
-    if (typeof data.balance === "number") {
-      newBalance = data.balance;
-    } else {
-      newBalance = Number(data.balance) || 0;
+  // Direct Message (Private Chat)
+  socket.on('private-message', (msgData) => {
+    const targetSocket = io.sockets.sockets.get(msgData.to);
+    if (targetSocket) {
+      const messageId = uuidv4();
+      targetSocket.emit('message', { 
+        ...msgData, id: messageId, from: socket.id, timestamp: Date.now() 
+      });
+      socket.emit('message-confirmed', { id: messageId });
     }
+  });
 
-    if (!db.users[data.userId]) {
-      db.users[data.userId] = { balance: 50000 };
+  // System Story
+  socket.on('add-story', (data) => {
+    const user = users.get(socket.id);
+    if (!user) return;
+    const newStory = {
+      id: uuidv4(),
+      userId: socket.id,
+      name: user.name,
+      avatar: user.avatar,
+      url: data.url,
+      type: data.type, // 'image' or 'video'
+      caption: data.caption,
+      views: [],
+      timestamp: Date.now()
+    };
+    stories.push(newStory);
+    io.emit('update-stories', stories); // Broadcast ke semua
+  });
+
+  socket.on('view-story', (storyId) => {
+    const story = stories.find(s => s.id === storyId);
+    if (story && !story.views.some(v => v.id === socket.id)) {
+      const user = users.get(socket.id);
+      story.views.push({ id: socket.id, name: user ? user.name : 'Unknown', avatar: user ? user.avatar : '' });
+      io.emit('update-stories', stories); // Update info views
     }
-
-    db.users[data.userId].balance = newBalance;
-    writeDB(db);
-
-    console.log(`Update saldo ${data.userId}: ${newBalance}`);
-
-    io.to(data.userId).emit("saldoUpdate", {
-      userId: data.userId,
-      balance: newBalance
-    });
   });
 
-  socket.on("adminResetSaldo", userId => {
-    if (!userId) return;
-
-    const db = readDB();
-    db.users[userId] = { balance: "Aktivasi" };
-    writeDB(db);
-
-    console.log(`Reset saldo ${userId} => Aktivasi`);
-
-    io.to(userId).emit("saldoUpdate", {
-      userId,
-      balance: "Aktivasi"
-    });
+  // Calls
+  socket.on('call-user', (data) => {
+    const targetSocket = io.sockets.sockets.get(data.to);
+    if (targetSocket) {
+      activeCalls.set(socket.id, { to: data.to, timeout: setTimeout(() => {
+        socket.emit('call-timeout');
+        activeCalls.delete(socket.id);
+      }, 30000)});
+      targetSocket.emit('incoming-call', { from: socket.id, name: users.get(socket.id)?.name });
+    }
   });
 
-  socket.on("disconnect", () => {
-    console.log("Client disconnected:", socket.id);
+  socket.on('accept-call', (data) => {
+    const caller = io.sockets.sockets.get(data.to);
+    if (caller) caller.emit('call-accepted', { from: socket.id });
+  });
+
+  socket.on('reject-call', (data) => {
+    const caller = io.sockets.sockets.get(data.to);
+    if (caller) caller.emit('call-rejected');
+  });
+
+  socket.on('offer', (data) => {
+    const target = io.sockets.sockets.get(data.to);
+    if (target) target.emit('offer', { offer: data.offer, from: socket.id });
+  });
+
+  socket.on('answer', (data) => {
+    const target = io.sockets.sockets.get(data.to);
+    if (target) target.emit('answer', { answer: data.answer, from: socket.id });
+  });
+
+  socket.on('ice', (data) => {
+    const target = io.sockets.sockets.get(data.to);
+    if (target) target.emit('ice', { candidate: data.candidate, from: socket.id });
+  });
+
+  socket.on('end-call', (data) => {
+    const target = io.sockets.sockets.get(data.to);
+    if (target) target.emit('end-call');
+  });
+
+  socket.on('disconnect', () => {
+    users.delete(socket.id);
+    // Hapus story user yang offline (opsional, bisa dibiarkan bertahan 24 jam dengan cron/setTimeout)
+    broadcastOnlineUsers();
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+server.listen(PORT, '0.0.0.0', () => console.log(`Server jalan di port ${PORT}`));
