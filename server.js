@@ -63,7 +63,6 @@ io.on('connection', (socket) => {
     socket.emit('update-stories', getActiveStories());
   });
 
-  // UPDATE PROFIL (Nama, Bio, Foto)
   socket.on('update-profile', (data) => {
     const userId = socketToUser.get(socket.id);
     if(userId && users.has(userId)) {
@@ -84,7 +83,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // PRIVATE MESSAGE & BLOKIR CHECK
   socket.on('private-message', (msgData) => {
     const senderId = socketToUser.get(socket.id);
     const targetUserId = msgData.to;
@@ -125,7 +123,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // STORIES
   socket.on('add-story', (data) => {
     const userId = socketToUser.get(socket.id);
     const user = users.get(userId);
@@ -154,7 +151,6 @@ io.on('connection', (socket) => {
     io.emit('update-stories', getActiveStories());
   });
 
-  // WEBRTC CALLS & BLOKIR CHECK
   socket.on('call-user', (data) => {
     const senderId = socketToUser.get(socket.id);
     const target = users.get(data.to);
