@@ -2,86 +2,411 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
-const cors = require('cors');
+const { v4: uuidv4 } = require('uuid');
+const cloudinary = require('cloudinary').v2;
+
+cloudinary.config({
+  cloud_name:     'davgb7tjm',        
+  api_key:        '211214865765642',          
+  api_secret:     '3OG8-xUQlkYGt1uYO7yrPVoPFCo',  
+  secure: true
+});
 
 const app = express();
 const server = http.createServer(app);
-
-// Memungkinkan Cross-Origin Resource Sharing (CORS)
-app.use(cors());
-
-// Menyajikan file statis dari folder public
-app.use(express.static(path.join(__dirname, 'public')));
-
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Menyimpan data user aktif di memory server
-const users = {};
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+app.use(express.static('public'));
+
+app.get('/', (req, res) => {
+  res.status(200).send('Live');
+});
+
+const waitingUsers = new Map();
+const pairs = new Map();                
+const userInfo = new Map();
+const activeCalls = new Map();          
+const recentlyEndedCalls = new Set();
+
+function getDisplayName(id) {
+  const info = userInfo.get(id);
+  return info?.name?.trim() && info.name.trim() !== '' ? info.name.trim() : 'Pengguna';
+}
+
+function getPartner(socketId) {
+  const partnerId = pairs.get(socketId);
+  return partnerId ? io.sockets.sockets.get(partnerId) : null;
+}
+
+function sendSystemMsg(fromId, text) {
+  const partner = getPartner(fromId);
+  if (partner) {
+    partner.emit('message', {
+      id: 'sys-' + Date.now(),
+      type: 'text',
+      text,
+      system: true,
+      timestamp: Date.now()
+    });
+  }
+}
+
+function cleanUp(socket) {
+  const partner = getPartner(socket.id);
+  const name = getDisplayName(socket.id);
+
+  if (partner) {
+    sendSystemMsg(socket.id, `${name} telah keluar dari chat`);
+    partner.emit('partner-left');
+    pairs.delete(partner.id);
+  }
+
+  pairs.delete(socket.id);
+  waitingUsers.delete(socket.id);
+  // userInfo tidak langsung dihapus agar history tidak hilang jika reconnect (bisa dihapus jika perlu, namun untuk sementara biarkan)
+  
+  for (const [cid, call] of activeCalls.entries()) {
+    if (cid === socket.id || call.to === socket.id) {
+      if (call.timeout) clearTimeout(call.timeout);
+      activeCalls.delete(cid);
+      const other = io.sockets.sockets.get(cid === socket.id ? call.to : cid);
+      if (other) other.emit('call-rejected', { reason: 'partner terputus' });
+    }
+  }
+
+  broadcastOnlineUsers();
+}
+
+function tryMatchWaiting() {
+  const byServer = new Map();
+  for (const [id, e] of waitingUsers.entries()) {
+    const s = e.info.server;
+    if (!byServer.has(s)) byServer.set(s, []);
+    byServer.get(s).push(id);
+  }
+
+  for (const ids of byServer.values()) {
+    let i = 0;
+    while (i < ids.length) {
+      let matched = false;
+      for (let j = i + 1; j < ids.length; j++) {
+        const id1 = ids[i];
+        const id2 = ids[j];
+        const e1 = waitingUsers.get(id1);
+        const e2 = waitingUsers.get(id2);
+        
+        if (!e1 || !e2) continue;
+
+        // Cek History Bertemu (Hanya Sekali)
+        if (!e1.info.history.has(id2) && !e2.info.history.has(id1)) {
+          pairs.set(id1, id2);
+          pairs.set(id2, id1);
+
+          e1.info.history.add(id2);
+          e2.info.history.add(id1);
+
+          e1.socket.emit('matched', userInfo.get(id2));
+          e2.socket.emit('matched', userInfo.get(id1));
+
+          waitingUsers.delete(id1);
+          waitingUsers.delete(id2);
+          
+          ids.splice(j, 1);
+          ids.splice(i, 1);
+          matched = true;
+          console.log(`Match berhasil: ${id1} ↔ ${id2}`);
+          break;
+        }
+      }
+      if (!matched) {
+        i++;
+      }
+    }
+  }
+
+  broadcastOnlineUsers();
+}
+
+function broadcastOnlineUsers() {
+  const onlineList = [];
+  for (const [id, entry] of waitingUsers.entries()) {
+    const info = userInfo.get(id);
+    if (info) {
+      onlineList.push({
+        socketId: id,
+        name: info.name || "Anonim",
+        age: info.age || "?",
+        gender: info.gender || "-",
+        job: info.job || "-",
+        server: info.server
+      });
+    }
+  }
+  io.emit("online-users", onlineList);
+  io.emit("online-count", onlineList.length); 
+}
+
+let onlineUsers = 0;
 
 io.on('connection', (socket) => {
-  console.log('User terhubung:', socket.id);
+  onlineUsers++;
+  io.emit('online-count', onlineUsers);
+  broadcastOnlineUsers();
 
-  // Event Registrasi User
-  socket.on('register', (data) => {
-    users[socket.id] = {
-      id: socket.id,
-      name: data.name,
-      bio: data.bio,
-      avatar: data.avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${socket.id}`
+  socket.on('disconnect', () => {
+    onlineUsers--;
+    io.emit('online-count', onlineUsers);
+    cleanUp(socket);
+    broadcastOnlineUsers(); 
+  });
+
+  socket.on('get-online-count', () => {
+    socket.emit('online-count', onlineUsers);
+  });
+
+  socket.on('join', (data) => {
+    if (!data?.server) {
+      socket.emit('error', { message: 'Server harus dipilih' });
+      return;
+    }
+
+    // Jika user sudah ada info (krn reconnect) pertahankan history & story
+    let existingInfo = userInfo.get(socket.id) || { history: new Set(), stories: [], profilePic: data.profilePic || '' };
+
+    const userData = {
+      name:   data.name   ? String(data.name).trim()   : 'Anonim',
+      age:    data.age    ? Number(data.age)           : null,
+      gender: data.gender ? String(data.gender).trim() : '-',
+      job:    data.job    ? String(data.job).trim()    : '-',
+      server: data.server,
+      profilePic: data.profilePic || existingInfo.profilePic,
+      history: existingInfo.history,
+      stories: existingInfo.stories
     };
 
-    // Kirim konfirmasi registrasi ke user tersebut
-    socket.emit('registered', users[socket.id]);
+    userInfo.set(socket.id, userData);
+    waitingUsers.set(socket.id, { socket, info: userData });
 
-    // Beritahu pengguna lain bahwa ada user baru
-    io.emit('userListUpdate', Object.values(users));
+    tryMatchWaiting();
+    broadcastOnlineUsers();
   });
 
-  // Event Update Foto Profil Real-time
-  socket.on('updateAvatar', (newAvatarUrl) => {
-    if (users[socket.id]) {
-      users[socket.id].avatar = newAvatarUrl;
-      
-      // Update data di sisi client yang mengirim
-      socket.emit('avatarUpdated', newAvatarUrl);
-
-      // Siarkan pembaruan daftar user ke semua client
-      io.emit('userListUpdate', Object.values(users));
+  // --- STORY & PROFILE EVENTS ---
+  socket.on('update-profile-pic', (url) => {
+    const info = userInfo.get(socket.id);
+    if (info) {
+        info.profilePic = url;
+        const partner = getPartner(socket.id);
+        if (partner) partner.emit('partner-profile-updated', url);
     }
   });
 
-  // Event Kirim Pesan Real-time
-  socket.on('sendMessage', (messageText) => {
-    const user = users[socket.id];
-    if (user) {
-      const msgData = {
-        senderId: socket.id,
-        senderName: user.name,
-        senderAvatar: user.avatar,
-        text: messageText,
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      };
-      
-      // Kirim pesan ke semua client yang terhubung
-      io.emit('newMessage', msgData);
+  socket.on('add-story', (url) => {
+    const info = userInfo.get(socket.id);
+    if (info) {
+        info.stories.push({
+            id: uuidv4(),
+            url: url,
+            timestamp: Date.now(),
+            viewers: []
+        });
     }
   });
 
-  // Event Disconnect / Logout
-  socket.on('disconnect', () => {
-    console.log('User terputus:', socket.id);
-    delete users[socket.id];
-    io.emit('userListUpdate', Object.values(users));
+  socket.on('get-stories', () => {
+      const myInfo = userInfo.get(socket.id);
+      const partner = getPartner(socket.id);
+      let partnerInfo = partner ? userInfo.get(partner.id) : null;
+      
+      socket.emit('stories-data', {
+          myStories: myInfo ? myInfo.stories : [],
+          partnerStories: partnerInfo ? partnerInfo.stories : [],
+          partnerName: partnerInfo ? partnerInfo.name : 'Partner'
+      });
+  });
+
+  socket.on('view-story', (storyId) => {
+      const partner = getPartner(socket.id);
+      const myInfo = userInfo.get(socket.id);
+      if (partner && myInfo) {
+          const partnerInfo = userInfo.get(partner.id);
+          if (partnerInfo) {
+              const story = partnerInfo.stories.find(s => s.id === storyId);
+              if (story) {
+                  // Cek apakah sudah pernah melihat
+                  if (!story.viewers.find(v => v.id === socket.id)) {
+                      story.viewers.push({ id: socket.id, name: myInfo.name });
+                  }
+              }
+          }
+      }
+  });
+  // ------------------------------
+
+  socket.on('message', (msgData) => {
+    const partner = getPartner(socket.id);
+    if (!partner) return;
+
+    const messageId = uuidv4();
+    const fullMessage = {
+      id: messageId,
+      ...msgData,
+      timestamp: Date.now(),
+      from: socket.id
+    };
+
+    partner.emit('message', fullMessage);
+    socket.emit('message-confirmed', { id: messageId });
+  });
+
+  socket.on('delete-for-everyone', ({ msgId }) => {
+    const partner = getPartner(socket.id);
+    if (!partner) return;
+    socket.emit('delete-for-everyone', { msgId });
+    partner.emit('delete-for-everyone', { msgId });
+  });
+
+  socket.on('typing', () => {
+    const p = getPartner(socket.id);
+    if (p) p.emit('typing');
+  });
+
+  socket.on('upload-file', async (data, callback) => {
+    const { buffer, filename, mimetype, caption, viewOnce } = data;
+
+    if (!buffer || !filename || !mimetype?.startsWith('image/')) {
+      return callback?.({ success: false, error: 'Data file tidak valid' });
+    }
+
+    try {
+      if (buffer.length > 10 * 1024 * 1024) {
+        return callback?.({ success: false, error: 'File terlalu besar maks 10MB' });
+      }
+
+      const uploadResult = await new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          {
+            resource_type: 'image',
+            folder: 'sanz-chat',
+            public_id: `${Date.now()}-${uuidv4().slice(0, 8)}`,
+            overwrite: true,
+            format: path.extname(filename).slice(1) || 'jpg'
+          },
+          (error, result) => {
+            if (error) return reject(error);
+            resolve(result);
+          }
+        );
+        uploadStream.end(Buffer.from(buffer));
+      });
+
+      const imageUrl = uploadResult.secure_url;
+      const partner = getPartner(socket.id);
+
+      if (partner) {
+        const messageId = uuidv4();
+        const fileMsg = {
+          id: messageId,
+          type: 'file',
+          fileUrl: imageUrl,
+          caption: caption || '',
+          viewOnce: !!viewOnce,
+          timestamp: Date.now(),
+          from: socket.id
+        };
+
+        partner.emit('message', fileMsg);
+        socket.emit('message-confirmed', { id: messageId });
+      }
+
+      callback?.({ success: true, url: imageUrl });
+
+    } catch (err) {
+      console.error('Cloudinary upload gagal:', err.message || err);
+      callback?.({ success: false, error: 'Gagal upload gambar ke Cloudinary' });
+    }
+  });
+
+  // === WEBRTC EVENTS ===
+  socket.on('call-user', () => {
+    const partner = getPartner(socket.id);
+    if (!partner) {
+      socket.emit('call-failed', { reason: 'Partner tidak tersedia atau sudah keluar' });
+      return;
+    }
+
+    if (activeCalls.has(socket.id)) {
+      socket.emit('call-failed', { reason: 'Panggilan sedang berlangsung' });
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      socket.emit('call-timeout');
+      activeCalls.delete(socket.id);
+    }, 30000);
+
+    activeCalls.set(socket.id, { to: partner.id, timeout });
+    partner.emit('incoming-call', { name: getDisplayName(socket.id) });
+    socket.emit('call-sent');
+  });
+
+  socket.on('accept-call', () => {
+    let callerId = null;
+    for (const [id, call] of activeCalls.entries()) {
+      if (call.to === socket.id) { callerId = id; break; }
+    }
+    if (!callerId) return;
+
+    const caller = io.sockets.sockets.get(callerId);
+    if (caller) {
+      clearTimeout(activeCalls.get(callerId).timeout);
+      activeCalls.delete(callerId);
+      caller.emit('call-accepted');
+    }
+  });
+
+  socket.on('reject-call', () => {
+    let callerId = null;
+    for (const [id, call] of activeCalls.entries()) {
+      if (call.to === socket.id) { callerId = id; break; }
+    }
+    if (callerId) {
+      clearTimeout(activeCalls.get(callerId).timeout);
+      activeCalls.delete(callerId);
+      const caller = io.sockets.sockets.get(callerId);
+      if (caller) caller.emit('call-rejected');
+    }
+  });
+
+  socket.on('offer', (offer) => { const p = getPartner(socket.id); if (p) p.emit('offer', offer); });
+  socket.on('answer', (answer) => { const p = getPartner(socket.id); if (p) p.emit('answer', answer); });
+  socket.on('ice', (candidate) => { const p = getPartner(socket.id); if (p) p.emit('ice', candidate); });
+
+  socket.on('media-status', (status) => {
+    const partner = getPartner(socket.id);
+    if (partner) partner.emit('media-status', status);
+  });
+
+  socket.on('end-call', () => {
+    if (recentlyEndedCalls.has(socket.id)) return;
+    recentlyEndedCalls.add(socket.id);
+    setTimeout(() => recentlyEndedCalls.delete(socket.id), 8000);
+
+    const p = getPartner(socket.id);
+    if (p) {
+      sendSystemMsg(socket.id, `Panggilan berakhir`);
+      p.emit('end-call');
+    }
+    activeCalls.delete(socket.id);
   });
 });
 
-// Port dinamis agar kompatibel dengan Render.com
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server WhatsApp Clone berjalan di port ${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server berjalan di port ${PORT}`);
 });
